@@ -28,6 +28,7 @@ jobs:
             | grep -oE '[0-9]+' | sort -n | tail -1 || true)
           if [ -z "$stage" ]; then
             echo "제목에서 단계를 찾지 못했습니다" >> "$GITHUB_STEP_SUMMARY"
+            echo "GATE_REPORTED=1" >> "$GITHUB_ENV"
             exit 1
           fi
           echo "value=$stage" >> "$GITHUB_OUTPUT"
@@ -37,9 +38,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # 비공개 테스트를 붙이려면 secret이 있는 job에서 부원 코드를 실행해야 해서 의도적으로 켠다.
+      # 운영 전에 격리 환경으로 옮긴다.
       - name: PR 코드 받기
         uses: actions/checkout@v4
         with:
+          allow-unsafe-pr-checkout: true
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr
@@ -82,6 +86,7 @@ jobs:
         run: |
           if ! ./gradlew compileJava compileTestJava -q < /dev/null > /dev/null 2>&1; then
             echo "빌드 실패" >> "$GITHUB_STEP_SUMMARY"
+            echo "GATE_REPORTED=1" >> "$GITHUB_ENV"
             exit 1
           fi
 
@@ -93,6 +98,7 @@ jobs:
           classes=$(awk -v s="$STAGE" '$1 == s { $1 = ""; print }' "$RUNNER_TEMP/gate/stages.txt")
           if [ -z "$classes" ]; then
             echo "제목에서 단계를 찾지 못했습니다" >> "$GITHUB_STEP_SUMMARY"
+            echo "GATE_REPORTED=1" >> "$GITHUB_ENV"
             exit 1
           fi
           cat > "$RUNNER_TEMP/gate/timeout.gradle" <<'EOF'
@@ -112,4 +118,10 @@ jobs:
           done < "$RUNNER_TEMP/gate/methods.txt"
           rm -rf "$RUNNER_TEMP/gate" build/reports build/test-results
           echo "${total}개 중 ${passed}개 통과" >> "$GITHUB_STEP_SUMMARY"
+          echo "GATE_REPORTED=1" >> "$GITHUB_ENV"
           [ "$passed" -eq "$total" ]
+
+      # 어느 step이든 실패했는데 안내가 없으면 부원이 빨간 job만 보게 된다.
+      - name: CI 오류 안내
+        if: failure() && env.GATE_REPORTED != '1'
+        run: echo "CI 오류로 검사하지 못했습니다" >> "$GITHUB_STEP_SUMMARY"
