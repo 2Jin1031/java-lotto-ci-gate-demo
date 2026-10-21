@@ -1,0 +1,115 @@
+name: CI 게이트
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MISSION: lotto
+    steps:
+      - name: 단계 읽기
+        id: stage
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          stage=$(printf '%s' "$PR_TITLE" \
+            | grep -oE '[0-9]+([[:space:]]*[,~-][[:space:]]*[0-9]+)*[[:space:]]*단계' \
+            | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+          if [ -z "$stage" ]; then
+            echo "제목에서 단계를 찾지 못했습니다" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "value=$stage" >> "$GITHUB_OUTPUT"
+
+      - name: base 브랜치 받기
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: PR 코드 받기
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      # 빌드 파일(build.gradle, settings.gradle, gradlew, gradle/)은 base 것을 그대로 쓰고,
+      # PR에서는 src/main만 가져온다. 부원의 src/test, buildSrc, gradle.properties는 들어오지 않는다.
+      - name: PR 코드 붙이기
+        run: |
+          rm -rf src
+          mkdir -p src/test/java
+          if [ -d pr/src/main ]; then cp -R pr/src/main src/main; fi
+          rm -rf pr
+
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # deploy key는 이 step에서만 쓰고 끝나면 지운다.
+      - name: 게이트 테스트 받기
+        env:
+          GATE_KEY: ${{ secrets.CI_GATE_TESTS_KEY }}
+        run: |
+          key="$RUNNER_TEMP/gate_key"
+          hosts="$RUNNER_TEMP/gate_known_hosts"
+          trap 'rm -f "$key" "$hosts"' EXIT
+          printf '%s\n' "$GATE_KEY" > "$key"
+          chmod 600 "$key"
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$hosts"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$hosts -o StrictHostKeyChecking=yes" \
+            git clone -q --depth 1 git@github.com:cho-log/ci-gate-tests.git "$RUNNER_TEMP/gate-repo" > /dev/null 2>&1
+          mkdir -p "$RUNNER_TEMP/gate"
+          cp "$RUNNER_TEMP/gate-repo/$MISSION/stages.txt" "$RUNNER_TEMP/gate-repo/$MISSION/methods.txt" "$RUNNER_TEMP/gate/"
+          cp "$RUNNER_TEMP/gate-repo/$MISSION/"*.java src/test/java/
+          rm -rf "$RUNNER_TEMP/gate-repo"
+
+      - name: 빌드
+        run: |
+          if ! ./gradlew compileJava compileTestJava -q < /dev/null > /dev/null 2>&1; then
+            echo "빌드 실패" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # 메서드마다 따로 실행한다. forkEvery는 클래스 단위라 static Scanner 코드를 못 받친다.
+      - name: 게이트 테스트
+        env:
+          STAGE: ${{ steps.stage.outputs.value }}
+        run: |
+          classes=$(awk -v s="$STAGE" '$1 == s { $1 = ""; print }' "$RUNNER_TEMP/gate/stages.txt")
+          if [ -z "$classes" ]; then
+            echo "제목에서 단계를 찾지 못했습니다" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/gate/timeout.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { timeout = java.time.Duration.ofSeconds(60) }
+          }
+          EOF
+          total=0
+          passed=0
+          while IFS= read -r method; do
+            case " $classes " in *" ${method%%.*} "*) ;; *) continue ;; esac
+            total=$((total + 1))
+            if timeout 180 ./gradlew test --tests "$method" --init-script "$RUNNER_TEMP/gate/timeout.gradle" -q \
+                < /dev/null > /dev/null 2>&1; then
+              passed=$((passed + 1))
+            fi
+          done < "$RUNNER_TEMP/gate/methods.txt"
+          rm -rf "$RUNNER_TEMP/gate" build/reports build/test-results
+          echo "${total}개 중 ${passed}개 통과" >> "$GITHUB_STEP_SUMMARY"
+          [ "$passed" -eq "$total" ]
